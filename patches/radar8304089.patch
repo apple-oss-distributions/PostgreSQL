@@ -65,10 +65,10 @@ diff -Naur postgresql-9.0.1/src/template/darwin postgresql/src/template/darwin
  esac
 +
 +USE_POSIX_SHARED_MEMORY=1
-diff -Naur postgresql-9.0.1/src/backend/port/posix_shmem.c postgresql/src/backend/port/posix_shmem.c
---- postgresql-9.0.1/src/backend/port/posix_shmem.c.orig	1969-12-31 18:00:00.000000000 -0600
-+++ postgresql/src/backend/port/posix_shmem.c	2010-10-05 21:57:01.000000000 -0500
-@@ -0,0 +1,578 @@
+diff -Naur postgresql-9.1.1/src/backend/port/posix_shmem.c postgresql/src/backend/port/posix_shmem.c
+--- postgresql-9.1.1/src/backend/port/posix_shmem.c.orig	1969-12-31 18:00:00.000000000 -0600
++++ postgresql/src/backend/port/posix_shmem.c	2011-10-10 14:05:00.000000000 -0500
+@@ -0,0 +1,582 @@
 +/*-------------------------------------------------------------------------
 + *
 + * posix_shmem.c
@@ -210,6 +210,7 @@ diff -Naur postgresql-9.0.1/src/backend/port/posix_shmem.c postgresql/src/backen
 +	int			fd, sysVNattachSegShmid;
 +	void	   *shmaddr, *sysVNattachSegMemAddr;
 +	const char *ipcName = GenerateIPCName();
++	char		line[64];
 +	
 +	/* Create a small SysV shared memory segment to use to prevent
 +	 * new postmasters from starting up when there are still
@@ -323,8 +324,11 @@ diff -Naur postgresql-9.0.1/src/backend/port/posix_shmem.c postgresql/src/backen
 +
 +	/* Record SysV shmid in lockfile for data directory so contending postmasters
 +	 * can detect whether any orpahned backends are still in the database. 
++	 * Format it so that it's always the same length.
 +	 */
-+	RecordSharedMemoryInLockFile(0, sysVNattachSegShmid);
++	snprintf(line, sizeof line, "%9lu %9lu", 0UL,
++			 (unsigned long) sysVNattachSegShmid);
++	AddToDataDirLockFile(LOCK_FILE_LINE_SHMEM_KEY, line);
 +
 +	/* Save address for possible future use */
 +	UsedShmemSegAddr = shmaddr;

@@ -1,11 +1,16 @@
-#!/usr/bin/ruby 
+#!/usr/bin/ruby
 #
 # postgresql_backup.rb - PostgreSQL Service backup and restore plugin for ServerBackup.
 # Consolidates the _backup, _restore, and _verify functions in a single tool
 #
 # Author:: Apple Inc.
 # Documentation:: Apple Inc.
-# Copyright © 2011, Apple Inc.
+# Copyright (c) 2011-2012 Apple Inc. All Rights Reserved.
+#
+# IMPORTANT NOTE: This file is licensed only for use on Apple-branded
+# computers and is subject to the terms and conditions of the Apple Software
+# License Agreement accompanying the package this file is a part of.
+# You may not port this file to another platform without Apple's written consent.
 # License:: All rights reserved.
 #
 
@@ -41,11 +46,11 @@ class PostgreSQLTool < BackupTool
 	# Constants
 	#
 	BACKUP_DIR = "/Library/Server/PostgreSQL/Backup"
+	BACKUP_FILE_UNCOMPRESSED = "dumpall.psql"
 	BACKUP_FILE = "dumpall.psql.gz"
-	DB_DIR = "/private/var/pgsql"
+	DB_DIR = "/Library/Server/PostgreSQL/Data"
 	SECRET_DIR = "/.ServerBackups/postgresql"
-	LOG_DIR = "/Library/Logs"
-	LOG_FILE = "PostgreSQL.log"
+	LOG_DIR = "/Library/Logs/PostgreSQL"
 	SOCKET_DIR = "/var/pgsql_socket"
 
 	#
@@ -63,7 +68,7 @@ class PostgreSQLTool < BackupTool
 	# Get the current database location
 	def dataDir
 		dataDir = self.setting("postgres:dataDir")
-		if (dataDir.nil? || dataDir.empty? || dataDir["/var/pgsql"])
+		if (dataDir.nil? || dataDir.empty? || dataDir["/Library/Server/PostgreSQL/Data"])
 			$log.warn("Error determining data directory; using default.")
 			return DB_DIR
 		end
@@ -74,18 +79,10 @@ class PostgreSQLTool < BackupTool
 	# Get the current database backup location
 	def backupDir
 		dataDir = self.dataDir
-		if (dataDir.nil? || dataDir.empty? || dataDir["/var/pgsql"])
+		if (dataDir.nil? || dataDir.empty? || dataDir["/Library/Server/PostgreSQL/Data"])
 			return BACKUP_DIR
 		end
 		return dataDir.sub(/Data\z/, "Backup")
-	end
-
-	# Get the current log file
-	def logFile
-		logDir = self.setting("postgres:log_directory", LOG_DIR)
-		logFile = self.setting("postgres:log_filename", LOG_FILE)
-		$log.debug("Service log file is #{logDir}/#{logFile}")
-		return "#{logDir}/#{logFile}"
 	end
 
 	# Get the current socket directory.
@@ -97,22 +94,33 @@ class PostgreSQLTool < BackupTool
 
 	# Validate arguments and backup this service
 	def backup
+		status = EX_OK
 		unless (@options && @options[:path] && @options[:dataset])
+			status = EX_USAGE
 			raise OptionParser::InvalidArgument, "Missing arguments for 'backup'."
 		end
+		# Only attempt backup if the service is running
+		state = false
+		self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin status postgres") do |output|
+			state = ((/RUNNING/ =~ output) != nil)
+		end
+		orig_state = state
 		$log.debug("@options = #{@options.inspect}")
 		archive_dir = @options[:path]
 		unless (archive_dir[0] == ?/)
+			status = EX_USAGE
 			raise OptionParser::InvalidArgument, "Paths must be absolute."
 		end
 		what = @options[:dataset]
 		unless self.class::DATASETS.include?(what)
+			status = EX_USAGE
 			raise OptionParser::InvalidArgument, "Unknown data set '#{@options[:dataset]}' specified."
 		end
 		# The passed :archive_dir and :what are ignored because the dump is put
 		# on the live data volume
 		archive_dir = self.backupDir
 		dump_file = "#{archive_dir}/#{BACKUP_FILE}"
+		dump_file_uncompressed = "#{archive_dir}/#{BACKUP_FILE_UNCOMPRESSED}"
 		# Create the backup directory as necessary.
 		unless File.directory?(archive_dir)
 			if File.exists?(archive_dir)
@@ -127,18 +135,61 @@ class PostgreSQLTool < BackupTool
 		# Backup only once a day
 		mod_time = File.exists?(dump_file) ? File.mtime(dump_file) : Time.at(0)
 		if (Time.now - mod_time) >= (24 * 60 * 60)
+			# Attempt to start the service if needed
+			if (! state)
+				self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin start postgres") do |output|
+					state = ((/RUNNING/ =~ output) != nil)
+				end
+			end
+			if (! state)
+				$log.info "PostgreSQL is not running, skipping database backup"
+				return status
+			end
+
 			$log.info "Creating dump file \'#{dump_file}\'..."
-			system("/usr/bin/sudo -u _postgres /usr/bin/pg_dumpall | /usr/bin/gzip > #{dump_file.shellescape}")
+			system("/Applications/Server.app/Contents/ServerRoot/usr/bin/pg_dumpall -U _postgres > #{dump_file_uncompressed.shellescape}")
+			if ($?.exitstatus != 0)
+				$log.error "...Backup failed on pg_dumpall, Status=#{$?.exitstatus}"
+				status = EX_SOFTWARE
+			end
+			system("/usr/bin/gzip -f #{dump_file_uncompressed.shellescape}")				
 			if ($?.exitstatus == 0)
 				File.chmod(0640, dump_file)
 				File.chown(216, 216, dump_file)
 				$log.info "...Backup succeeded."
 			else
-				$log.error "...Backup failed! Status=#{$?.exitstatus}"
+				$log.error "...Backup failed on gzip! Status=#{$?.exitstatus}"
+				status = EX_SOFTWARE
+			end
+
+			# Restore original service state
+			if (! orig_state)
+				# What if a dependent service was launched while we were backing up?  We
+				# don't want to shut down postgres in that case.
+				wiki_state = false
+				calendar_state = false
+				addressbook_state = false
+				devicemgr_state = false
+				self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin status wiki") do |output|
+					wiki_state = ((/RUNNING/ =~ output) != nil)
+				end
+				self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin status calendar") do |output|
+					calendar_state = ((/RUNNING/ =~ output) != nil)
+				end
+				self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin status addressbook") do |output|
+					addressbook_state = ((/RUNNING/ =~ output) != nil)
+				end
+				self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin status devicemgr") do |output|
+					devicemgr_state = ((/RUNNING/ =~ output) != nil)
+				end
+				if (! (wiki_state || calendar_state || addressbook_state || devicemgr_state))
+					self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin stop postgres")
+				end
 			end
 		else
 			$log.info "Dump file is less than 24 hours old; skipping."
 		end
+		return status
 	end
 
 	# Validate arguments and verify that the backup archive matches the file system.
@@ -167,7 +218,7 @@ class PostgreSQLTool < BackupTool
 		end
 		digest_disk = Digest::SHA256.file("#{dump_file}")
 		digest_live = Digest::SHA256.new
-		open("|/usr/bin/sudo -u _postgres /usr/bin/pg_dumpall | /usr/bin/gzip") do |f|
+		open("|/Applications/Server.app/Contents/ServerRoot/usr/bin/pg_dumpall -U _postgres | /usr/bin/gzip") do |f|
 			buf = ""
 			while f.read(16384, buf)
 				digest_live << buf
@@ -178,16 +229,20 @@ class PostgreSQLTool < BackupTool
 
 	# Validate arguments and restore this service
 	def restore
+		status = EX_OK
 		unless (@options && @options[:path] && @options[:dataset] && @options[:target])
+			status = EX_USAGE
 			raise OptionParser::InvalidArgument, "Missing arguments for 'restore'."
 		end
 		$log.debug("@options = #{@options.inspect}")
 		source_dir = @options[:path]
 		unless (source_dir[0] == ?/)
+			status = EX_USAGE
 			raise OptionParser::InvalidArgument, "Paths must be absolute."
 		end
 		what = @options[:dataset]
 		unless self.class::DATASETS.include?(what)
+			status = EX_USAGE
 			raise OptionParser::InvalidArgument, "Unknown data set '#{@options[:dataset]}' specified."
 		end
 		if (what.to_sym == :configuration)
@@ -196,6 +251,7 @@ class PostgreSQLTool < BackupTool
 		end
 		target = @options[:target]
 		unless (target == "/")
+			status = EX_UNAVAILABLE
 			raise RuntimeError, "Databases can only be restored to a running service."
 		end
 
@@ -204,16 +260,12 @@ class PostgreSQLTool < BackupTool
 			source_dir = ""
 		end
 
-		# Create the log file if it doesn't exist.
-		log_file = self.logFile
-		if !File.exists?(log_file)
-			$log.warn "Recreating #{log_file}."
-			FileUtils.touch(log_file)
+		# Create the log dir if it doesn't exist.
+		if !File.exists?(LOG_DIR)
+			FileUtils.mkdir(LOG_DIR)
+			FileUtils.chmod(0755, LOG_DIR)
+			FileUtils.chown("_postgres", "_postgres", LOG_DIR)
 		end
-		# Always ensure the permissions & ownership are correct.
-		FileUtils.chmod(0660, log_file)
-		# _postgres has uid of 216; using instead of string in case user db hasn't yet been restored
-		FileUtils.chown(216, "admin", log_file)
 
 		# Create the socket directory if it doesn't exist.
 		socket_dir = self.socketDir
@@ -228,16 +280,17 @@ class PostgreSQLTool < BackupTool
 		dump_file = "#{source_dir}#{archive_dir}/#{BACKUP_FILE}"
 		$log.info "Restoring \'#{dump_file}\' to \'#{target}\'..."
 		unless File.file?(dump_file)
+			status = EX_NOINPUT
 			raise RuntimeError, "Backup file not present in source volume! Nothing to restore!"
 		end
 
 		# Recall if the service was previously enabled
 		db_dir = self.dataDir
 		state = false
-		self.launch("/usr/sbin/serveradmin status postgres") do |output|
+		self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin status postgres") do |output|
 			state = ((/RUNNING/ =~ output) != nil)
 		end
-		self.launch("/usr/sbin/serveradmin stop postgres") if state
+		self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin stop postgres") if state
 		if (File.directory?(db_dir))
 			$log.info "...moving aside previous database..."
 			FileUtils.mv(db_dir, "#{db_dir}.pre-restore-#{Time.now.strftime('%Y-%m-%d_%H:%M:%S_%Z')}")
@@ -246,12 +299,13 @@ class PostgreSQLTool < BackupTool
 		FileUtils.mkdir_p(db_dir, :mode => 0700)
 		# _postgres:_postgres has uid:gid of 216:216
 		File.chown(216, 216, db_dir)
-		self.launch("/usr/bin/sudo -u _postgres /usr/bin/initdb --encoding UTF8 -D #{db_dir.shellescape}")
-		self.launch("/usr/sbin/serveradmin start postgres")
+		self.launch("/usr/bin/sudo -u _postgres /Applications/Server.app/Contents/ServerRoot/usr/bin/initdb --encoding UTF8 -D #{db_dir.shellescape}")
+		self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin start postgres")
 		$log.info "...replaying database contents (this may take a while)..."
-		system("/usr/bin/gzcat #{dump_file.shellescape} | /usr/bin/sudo -u _postgres /usr/bin/psql postgres")
-		self.launch("/usr/sbin/serveradmin stop postgres") unless state
+		system("/usr/bin/gzcat #{dump_file.shellescape} | /Applications/Server.app/Contents/ServerRoot/usr/bin/psql -U _postgres postgres")
+		self.launch("/Applications/Server.app/Contents/ServerRoot/usr/sbin/serveradmin stop postgres") unless state
 		$log.info "...Restore succeeded."
+		return status
 	end
 end
 
@@ -275,4 +329,4 @@ rescue
 	$log.error "unknown exception thrown\n"
 	exit EX_UNAVAILABLE
 end
-exit (status ? EX_OK : EX_UNAVAILABLE)
+exit status
